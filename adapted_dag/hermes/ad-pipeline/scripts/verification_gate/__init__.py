@@ -2,24 +2,25 @@
 """verification_gate — citation existence verification API (Delta 5).
 
 Public functions:
-  - verify_citation(entry, clients, *, ref_slug, anchor=None, cache=None)
+  - verify_citation(entry, clients, *, ref_slug, anchor=None, cache=None, bandit=None)
         -> CitationVerificationOutcome
   - verify_passport(passport, clients, *, ref_slug_by_key, anchors=None,
-        cache=None) -> list[outcome]
+        cache=None, bandit=None) -> list[outcome]
 
 Composes the four resolvers (crossref / openalex / semantic_scholar / arxiv),
 maps each resolver's execution to a {status, queried_by} outcome, derives the
 3-class lookup_verified via the Delta 4 reducer (narrowed-false, C-V6(a)),
 reads anchor_present from the v3.7.3 anchor marker, and stamps
-verification_timestamp. Both ref_slug and anchor are prose-sourced inputs joined
-upstream by citation_key — NEVER read off the corpus entry, whose schema forbids
-them (#332). Does NOT duplicate the v3.8 audit pipeline — it composes
-the same lower-layer resolvers and writes the unified summary schema (Delta 4).
+verification_timestamp.
 
-The returned dict validates against
-shared/contracts/passport/citation_verification_summary.schema.json.
+When a `bandit` is provided (ResolverBandit instance), the resolver execution
+order is optimized by the bandit's contextual multi-armed bandit algorithm:
+resolvers are tried sequentially in predicted-best order, and the search stops
+on the first match. Unattempted resolvers are reported as "skipped". When no
+bandit is provided, all four resolvers run in parallel (legacy behavior).
 
 Spec: docs/design/2026-05-21-v3.10-182-promote-citation-gate-spec.md §2 Delta 5.
+Bandit integration: scripts/resolver_bandit.py
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ try:
         _resolve_doi_then_title,
         queried_by_for,
     )
+    from resolver_bandit import ResolverBandit, CitationFeatures
 except ImportError:  # pragma: no cover - dual-path import
     from scripts.citation_verification_summary import (
         STATUS_MATCHED,
@@ -60,8 +62,31 @@ except ImportError:  # pragma: no cover - dual-path import
         _resolve_doi_then_title,
         queried_by_for,
     )
+    from scripts.resolver_bandit import ResolverBandit, CitationFeatures
 
 _ANCHOR_PRESENT_KINDS = frozenset({"quote", "page", "section", "paragraph"})
+
+_bandit: ResolverBandit | None = None
+
+ALL_RESOLVERS = ("crossref", "openalex", "semantic_scholar", "arxiv")
+
+
+def get_bandit(cache_path: str | None = None) -> ResolverBandit:
+    """Return the shared module-level ResolverBandit singleton.
+
+    The bandit accumulates statistics across calls, learning which resolvers
+    perform best for each citation profile. Persisted to disk via cache_path.
+    """
+    global _bandit
+    if _bandit is None:
+        _bandit = ResolverBandit(cache_path=cache_path)
+    return _bandit
+
+
+def reset_bandit():
+    """Reset the shared bandit singleton (for testing or fresh start)."""
+    global _bandit
+    _bandit = None
 
 
 def _is_valid_ref_slug(ref_slug: Any) -> bool:
@@ -120,6 +145,22 @@ def _run_arxiv(entry, client) -> dict[str, Any]:
     return _ran_outcome(unmatched, queried_by)
 
 
+def _run_single_resolver(resolver: str, entry, clients) -> dict[str, Any]:
+    """Dispatch one resolver by name, returning the outcome dict."""
+    client = clients.get(resolver)
+    if not client:
+        return _outcome(STATUS_UNREACHABLE, None)
+    if resolver == "crossref":
+        return _run_doi_then_title(entry, client, CrossrefUnavailable)
+    elif resolver == "openalex":
+        return _run_doi_then_title(entry, client, OpenAlexUnavailable)
+    elif resolver == "semantic_scholar":
+        return _run_semantic_scholar(entry, client)
+    elif resolver == "arxiv":
+        return _run_arxiv(entry, client)
+    return _outcome(STATUS_UNREACHABLE, None)
+
+
 def _anchor_present(anchor: Any) -> bool:
     """True iff the v3.7.3 anchor marker has kind ∈ {quote,page,section,paragraph}
     (not none). `anchor` is the already-parsed {kind, value} marker sourced from
@@ -131,6 +172,30 @@ def _anchor_present(anchor: Any) -> bool:
     return anchor.get("kind") in _ANCHOR_PRESENT_KINDS
 
 
+def _run_bandit_optimized(entry, clients, bandit) -> dict[str, str]:
+    """Run resolvers in bandit-optimized order, stopping at first match.
+
+    Returns a {resolver_name: outcome_dict} mapping with all four resolvers
+    represented. Resolvers not attempted due to an early match are marked
+    STATUS_SKIPPED so the summary schema is always complete.
+    """
+    features = CitationFeatures.from_entry(dict(entry))
+    resolver_order = bandit.select_resolvers(features)
+    resolver_outcomes: dict[str, Any] = {}
+
+    for resolver in resolver_order:
+        outcome = _run_single_resolver(resolver, entry, clients)
+        resolver_outcomes[resolver] = outcome
+        matched = outcome.get("status") == STATUS_MATCHED
+        bandit.update(resolver, reward=1.0 if matched else 0.0, features=features)
+        if matched:
+            break
+
+    for r in ALL_RESOLVERS:
+        resolver_outcomes.setdefault(r, _outcome(STATUS_SKIPPED, None))
+    return resolver_outcomes
+
+
 def verify_citation(
     entry: Mapping[str, Any],
     clients: Mapping[str, Any],
@@ -138,6 +203,7 @@ def verify_citation(
     ref_slug: str,
     anchor: Mapping[str, Any] | None = None,
     cache=None,
+    bandit: ResolverBandit | None = None,
 ) -> dict[str, Any]:
     """Verify one citation's existence across the four resolvers.
 
@@ -152,43 +218,34 @@ def verify_citation(
 
     `anchor` is the v3.7.3 anchor marker ({kind, value}) for this citation's
     ref_slug, already parsed from writer prose and joined upstream (None when no
-    anchor marker exists for the ref_slug). It is a SEPARATE input, not an entry
-    field — the anchor lives in prose, not in literature_corpus (spec Delta 4:
-    the summary is a join across three sources). `cache` is reserved for future
-    cache-through wiring at this layer (the resolver-level cache lands in
-    contamination_signals; threading it here is a Delta-2 follow-up).
+    anchor marker exists for the ref_slug).
+
+    When `bandit` is provided, the resolver execution order is optimized by
+    the bandit's contextual multi-armed bandit algorithm: resolvers are tried
+    sequentially in predicted-best order, stopping at the first match. Without
+    a bandit, all four resolvers run in parallel (legacy behavior).
 
     Returns a dict validating against citation_verification_summary.schema.json:
     {citation_key, ref_slug, lookup_verified, anchor_present,
      verification_timestamp, resolver_outcomes}.
     """
     if cache is not None:
-        # Honest forward-decl: the resolver-level cache lands in
-        # contamination_signals, but it is not yet threaded through this layer
-        # (a Delta-2 follow-up). Refuse rather than silently drop a cache the
-        # caller passed expecting it to take effect.
         raise NotImplementedError(
             "cache-through at the verification_gate layer is not yet wired "
             "(#182 Delta-2 follow-up); pass cache=None"
         )
     if not _is_valid_ref_slug(ref_slug):
-        # ref_slug is the prose-join key stamped verbatim into the summary, which
-        # the schema requires as a non-empty string. This is the single emission
-        # point (verify_passport routes through here), so the contract is enforced
-        # once: a non-string fails the schema's type:string, and an empty string
-        # joins to no <!--ref:slug--> marker. Either is a caller (prose-join) error
-        # — refuse rather than emit a contract-invalid / join-broken summary (#332).
         raise ValueError(
             f"ref_slug must be a non-empty string (the writer-prose join key), "
             f"got {ref_slug!r}; corpus entries do not carry ref_slug (#332)"
         )
     if entry.get("obtained_via") == "manual":
-        # v3.7.3 manual exemption: no resolver runs — all four skipped (checked
-        # once here rather than re-checked inside each resolver helper).
         resolver_outcomes = {
             r: _outcome(STATUS_SKIPPED, None)
-            for r in ("crossref", "openalex", "semantic_scholar", "arxiv")
+            for r in ALL_RESOLVERS
         }
+    elif bandit is not None:
+        resolver_outcomes = _run_bandit_optimized(entry, clients, bandit)
     else:
         resolver_outcomes = {
             "crossref": _run_doi_then_title(
@@ -216,26 +273,17 @@ def verify_passport(
     ref_slug_by_key: Mapping[str, str],
     anchors: Mapping[str, Mapping[str, Any]] | None = None,
     cache=None,
+    bandit: ResolverBandit | None = None,
 ) -> list[dict[str, Any]]:
     """Batch helper: run verify_citation over every entry in the passport's
     literature_corpus[].
 
-    `ref_slug_by_key` is the {citation_key: ref_slug} join map: corpus entries are
-    keyed by citation_key, writer prose is keyed by ref_slug, and the join across
-    them is the caller's (Stage 4→5 pipeline's) responsibility — the corpus entry
-    never carries ref_slug itself (#332). An entry whose citation_key has no joined
-    ref_slug raises ValueError rather than emitting a contract-invalid summary;
-    the per-entry summary contract requires a non-null string ref_slug, so a
-    missing join is a caller error, not a silently-defaulted field.
+    `ref_slug_by_key` is the {citation_key: ref_slug} join map.
+    `anchors` is the {ref_slug: anchor-marker} join map.
 
-    `anchors` is the {ref_slug: anchor-marker} join map parsed from writer prose
-    (the v3.7.3 <!--anchor:kind:value--> markers); each entry's anchor is looked
-    up by its (joined) ref_slug (absent → anchor_present False). Threading both
-    joins here keeps verify_citation a pure per-citation unit.
-
-    ref_slug_by_key is 1:1 (one summary row per corpus entry); per-prose-occurrence
-    verification (one entry under several ref slugs) is a different API shape, out
-    of scope here.
+    When `bandit` is provided, each citation is verified using bandit-optimized
+    sequential resolver selection (early break on match). Shared bandit instance
+    learns from all citations across the batch.
     """
     corpus = passport.get("literature_corpus") or []
     anchors = anchors or {}
@@ -244,10 +292,6 @@ def verify_passport(
         citation_key = entry.get("citation_key")
         ref_slug = ref_slug_by_key.get(citation_key)
         if not _is_valid_ref_slug(ref_slug):
-            # Missing join (None) OR a present-but-empty/non-string slug — both
-            # fail the per-summary contract. Caught here (not just in
-            # verify_citation) so the error names the offending citation_key,
-            # which the per-citation layer doesn't have (#332).
             raise ValueError(
                 f"no valid ref_slug joined for citation_key {citation_key!r} "
                 f"(got {ref_slug!r}): the citation_key→ref_slug prose join must "
@@ -256,5 +300,5 @@ def verify_passport(
             )
         outcomes.append(verify_citation(
             entry, clients, ref_slug=ref_slug,
-            anchor=anchors.get(ref_slug), cache=cache))
+            anchor=anchors.get(ref_slug), cache=cache, bandit=bandit))
     return outcomes
