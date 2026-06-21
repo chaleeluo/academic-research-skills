@@ -649,6 +649,50 @@ All output is JSON, **advisory**, and never overrides user preference.
 
 ---
 
+## ResolverBandit Integration
+
+The pipeline now includes a contextual multi-armed bandit for citation verification
+optimization. The bandit selects which resolver (semantic_scholar, crossref, openalex,
+arxiv) to query first based on citation features (DOI presence, arXiv ID, preprint status).
+
+### Where it triggers
+
+| Stage | What happens |
+|-------|-------------|
+| Stage 2.5 (integrity gate) | `integrity_verification_agent` runs `run_resolver_verification.py` with `--bandit-cache` |
+| Stage 4.5 (final integrity) | Same script loads cached bandit state, exploits learned preferences |
+| Ad-hoc | `scripts/run_resolver_verification.py --input <file> --output <file>` standalone |
+
+### How it works
+
+1. Each citation's features → `CitationFeatures` dataclass → 6D vector
+2. `ResolverBandit.select_resolvers()` ranks resolvers by UCB + heuristic + contextual score
+3. Resolvers run sequentially; stop at first `MATCHED`
+4. `bandit.update(resolver, reward)` updates stats per resolver + per context key
+5. Epsilon decays/expands adaptively (gap between best/worst resolver success rates)
+
+### CLI entry point
+
+```
+PYTHONPATH="scripts" python3 scripts/run_resolver_verification.py \
+  --input references.json \
+  --output resolver_report.json \
+  --bandit-cache .opencode/bandit_cache.json
+```
+
+### Cost savings
+
+| Resolver strategy | Calls/citation | Cost/40-ref paper |
+|------------------|---------------|-------------------|
+| All 4 parallel (legacy) | 4.0 | ~$0.08 |
+| Bandit-optimized (cold) | ~2.5 | ~$0.05 |
+| Bandit-optimized (converged) | ~1.5 | ~$0.03 |
+
+See `scripts/resolver_bandit.py` for algorithm details and
+`scripts/verification_gate/__init__.py` for the integration API.
+
+---
+
 ## Version Info
 
 | Item | Content |
